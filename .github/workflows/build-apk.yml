@@ -11,6 +11,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Set this to your inner Android project folder
+    defaults:
+      run:
+        working-directory: AISight
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
