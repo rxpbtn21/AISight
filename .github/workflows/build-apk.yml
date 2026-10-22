@@ -8,20 +8,27 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'zulu'
           java-version: '17'
 
+      - name: Grant execute permission for gradlew
+        working-directory: ./YOUR_SUBFOLDER_NAME  # Replace with your actual folder name (e.g., android or mobile)
+        run: chmod +x gradlew
+
       - name: Build APK with Gradle
+        working-directory: ./YOUR_SUBFOLDER_NAME  # Replace with your actual folder name
         run: ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: aisight-app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          path: /**/build/outputs/apk/debug/*.apk
