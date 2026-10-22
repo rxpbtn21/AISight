@@ -11,11 +11,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    # Set this to your inner Android project folder
-    defaults:
-      run:
-        working-directory: AISight
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -28,13 +23,18 @@ jobs:
         cache: 'gradle'
 
     - name: Grant execute permission for gradlew
+      # Added working-directory explicitly here
+      working-directory: AISight
       run: chmod +x gradlew
 
     - name: Build Debug APK
+      # Added working-directory explicitly here
+      working-directory: AISight
       run: ./gradlew assembleDebug
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
         name: app-debug-apk
-        path: app/build/outputs/apk/debug/app-debug.apk
+        # Corrected path to map the inner folder structure
+        path: AISight/app/build/outputs/apk/debug/app-debug.apk
