@@ -1,40 +1,71 @@
-name: Build Android APK
+name: Build AISight Mobile APK
 
 on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 90
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: 'gradle'
+      - name: Set up Python for model export
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/requirements-export.txt
 
-    - name: Grant execute permission for gradlew
-      # Added working-directory explicitly here
-      working-directory: AISight
-      run: chmod +x gradlew
+      - name: Install model export dependencies
+        run: python -m pip install -r scripts/requirements-export.txt
 
-    - name: Build Debug APK
-      # Added working-directory explicitly here
-      working-directory: AISight
-      run: ./gradlew assembleDebug
+      - name: Export custom AISight + YOLO26 depth models
+        run: python scripts/export_models.py
 
-    - name: Upload APK Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-debug-apk
-        # Corrected path to map the inner folder structure
-        path: AISight/app/build/outputs/apk/debug/app-debug.apk
+      - name: Download Vosk small English offline model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/assets
+          curl --fail --location --retry 4 --retry-delay 2 \
+            https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip \
+            --output /tmp/vosk-model.zip
+          unzip -q /tmp/vosk-model.zip -d /tmp/vosk-model
+          test -d /tmp/vosk-model/vosk-model-small-en-us-0.15
+          rm -rf app/src/main/assets/vosk-model-small-en-us-0.15
+          mv /tmp/vosk-model/vosk-model-small-en-us-0.15 app/src/main/assets/
+          test -f app/src/main/assets/vosk-model-small-en-us-0.15/conf/model.conf
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Assemble debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AISight-Mobile-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
