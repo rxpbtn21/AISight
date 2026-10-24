@@ -1345,6 +1345,10 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         }
     }
 
+    private static boolean isFinite(float value) {
+        return !Float.isNaN(value) && !Float.isInfinite(value);
+    }
+    
     private static String distanceBucket(float meters) {
         if (!isFinite(meters)) return "distance unavailable";
         if (meters <= 1.0f) return "very close";
