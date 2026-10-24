@@ -27,7 +27,7 @@ This is a native Android/Java port of the feature set in `thesisfinale.py`. It u
 
 ## Build the installable APK
 
-The source contains `.github/workflows/build-apk.yml`. The recommended route is:
+The source contains `.github/workflows/build-apk.yml`. The workflow uses `android-actions/setup-android@v4` and installs only `platform-tools` at setup; it then explicitly installs Android Platform 35 and Build Tools 35.0.0. This avoids the removed Google SDK package named `tools`, which caused an earlier setup step to fail. The recommended route is:
 
 1. Download and extract the ZIP; open the `AISightMobile` folder.
 2. Create a **private** GitHub repository (the ZIP contains your custom `aisight.pt` weights) and put the **contents** of `AISightMobile` at the repository root (`app/`, `models/`, `scripts/`, `.github/`, `build.gradle`, etc.).
