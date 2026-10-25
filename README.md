@@ -20,14 +20,18 @@ This is a native Android/Java port of the feature set in `thesisfinale.py`. It u
 | 5/10/30/60-second video recording | CameraX writes silent videos to `Movies/AISight` using MediaStore. Recording is silent by design so Vosk can keep listening. Some camera hardware may not support preview + analysis + recording simultaneously; the app falls back to camera analysis without recording if needed. |
 | MPU6050 fall heuristic | Uses the phone accelerometer with freefall-then-impact thresholds inspired by the source script. It may false-trigger or miss falls depending on where/how the phone is carried. It is not medical or emergency-grade fall detection. |
 | GPIO buzzer and alarm timeout | Phone vibration plus a repeated alarm tone, with a silence control and a 30-second maximum for fall alarms (shorter 5-second camera/mic failsafes). This is not a separate wearable buzzer. |
-| Camera/mic failsafes | Camera frame watchdog and camera/microphone warnings with retry/recovery behavior. Android cannot reliably confirm that the physical speaker is audible, so the original speaker-failure counter is not reproduced. |
+| Camera/mic failsafes | Camera heartbeat is tracked before inference, heavy inference runs on a separate worker, and a camera outage alert is latched once until a real frame confirms recovery. Microphone faults also warn/retry. Android cannot reliably confirm that the physical speaker is audible, so the original speaker-failure counter is not reproduced. |
 | Battery tracker | Announces current Android battery percentage and AISight's active session duration; warns at 15% battery. Reset command resets the session-duration counter. This replaces the Pi's fixed 8-hour consumption approximation. |
-| Headless mode | Black overlay, near-minimum screen brightness, hidden preview/detection text, and a slower analysis interval. Keeps the activity in the foreground and leaves Show Camera, Start/Pause, Settings, and conditional Silence Alarm controls. It does not turn off the screen, stop camera inference, or guarantee a particular battery saving. |
+| Headless mode | Black overlay, near-minimum screen brightness, hidden preview/detection text, a slower analysis interval, and a compact high-contrast control row. The visible dashboard uses a status card, live-camera chip, rounded preview, scene snapshot, and larger controls. Keeps the activity in the foreground and leaves Show Camera, Start/Pause, Settings, and conditional Silence Alarm controls. It does not turn off the screen, stop camera inference, or guarantee a particular battery saving. |
 | Pi `shutdown -h now` | Android apps cannot normally power off the phone. Voice “shutdown” asks for confirmation and then closes AISight only. |
+
+## Latest UI and failsafe improvements
+
+The main dashboard has been restyled with a high-contrast purple/navy palette, system status indicator, live-camera badge, scene snapshot, and more readable control buttons. The camera fault now alarms once per continuous outage and clears the latch only when CameraX delivers a real frame. Camera callbacks close frames quickly and send heavy object/depth inference to a dedicated single-flight worker; additional frames are dropped while inference is busy, so slow inference does not build a backlog or falsely trip the camera watchdog. The scene snapshot can show up to five objects even when voice announcements are capped to fewer objects. The code changes have not been validated with a fresh hosted APK/device test yet.
 
 ## Build the installable APK
 
-The source contains `.github/workflows/build-apk.yml`. The workflow uses `android-actions/setup-android@v4` and installs only `platform-tools` at setup; it then explicitly installs Android Platform 35 and Build Tools 35.0.0. This avoids the removed Google SDK package named `tools`, which caused an earlier setup step to fail. The recommended route is:
+The source contains `.github/workflows/build-apk.yml`. The workflow uses `android-actions/setup-android@v4` and installs only `platform-tools` at setup; it then explicitly installs Android Platform 36 and Build Tools 36.0.0 to satisfy CameraX 1.6.2 metadata requirements. This avoids the removed Google SDK package named `tools`, which caused an earlier setup step to fail. The recommended route is:
 
 1. Download and extract the ZIP; open the `AISightMobile` folder.
 2. Create a **private** GitHub repository (the ZIP contains your custom `aisight.pt` weights) and put the **contents** of `AISightMobile` at the repository root (`app/`, `models/`, `scripts/`, `.github/`, `build.gradle`, etc.).
@@ -39,7 +43,7 @@ The first hosted build can be large and take several minutes because it download
 
 ## Build locally
 
-Required: JDK 17, Android SDK Platform 35 and Build Tools 35, Gradle 8.11.1, Python 3.12, plus internet access to download/export the official depth model and the Vosk model. CameraX is pinned to stable 1.6.2 (listed by Android Developers as the stable release on August 26, 2026); the model exporter is pinned to Ultralytics 8.4.182 for reproducibility.
+Required: JDK 17, Android SDK Platform 36 and Build Tools 36.0.0, Gradle 8.11.1, Python 3.12, plus internet access to download/export the official depth model and the Vosk model. CameraX is pinned to stable 1.6.2 (listed by Android Developers as the stable release on August 26, 2026); the model exporter is pinned to Ultralytics 8.4.182 for reproducibility.
 
 ```bash
 python -m pip install -r scripts/requirements-export.txt
@@ -85,3 +89,8 @@ Commands must begin with **AISight** or **Eyesight**. The offline recognizer may
 - `app/src/main/java/.../DetectionOverlayView.java` — preview bounding boxes and labels
 - `app/src/main/java/.../MainActivity.java` — camera, OCR, voice commands/settings, video recording, fall alerts, battery, failsafe, headless mode
 - `.github/workflows/build-apk.yml` — hosted export and debug-APK build
+
+
+## App icon refresh
+
+The Android launcher now uses the AISight eye-and-microphone logo as both legacy density-specific icons and an Android adaptive icon (API 26+). The launcher label is `AISight`; the app version is `1.3-icon-refresh` (version code 4). Rebuild via GitHub Actions to apply it to the APK.
