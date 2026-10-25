@@ -12,6 +12,7 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.drawable.GradientDrawable;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.net.Uri;
@@ -144,19 +145,27 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         SPOKEN_CLASS_ALIASES.put("e tricycle", "e-tricycle");
     }
 
-    private final int bg = Color.rgb(9, 7, 14);
-    private final int panel = Color.rgb(22, 17, 32);
-    private final int purple = Color.rgb(169, 126, 255);
-    private final int white = Color.rgb(245, 242, 250);
-    private final int muted = Color.rgb(177, 169, 191);
+    private final int bg = Color.rgb(8, 10, 18);
+    private final int panel = Color.rgb(19, 23, 36);
+    private final int purple = Color.rgb(167, 139, 250);
+    private final int white = Color.rgb(245, 247, 255);
+    private final int muted = Color.rgb(161, 171, 194);
+    private final int mint = Color.rgb(153, 246, 228);
+    private final int warning = Color.rgb(251, 113, 133);
+    private final int stroke = Color.rgb(43, 49, 68);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService modelExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean readTextRequested = new AtomicBoolean(false);
+    private final AtomicBoolean inferenceInProgress = new AtomicBoolean(false);
     private final Map<String, Long> pausedClasses = new ConcurrentHashMap<>();
 
     private LinearLayout root, header, controls, topControls, bottomControls;
     private TextView statusView, detectionsView, headlessMessage;
+    private TextView statusDotView, detectionCountView, modelBadgeView, cameraChipView;
+    private LinearLayout statusCard, detectionCard;
+    private Button batteryButton;
+    private volatile String currentStatus = "LOADING MODELS";
     private PreviewView previewView;
     private DetectionOverlayView overlayView;
     private Button viewButton, settingsButton, readTextButton, voiceButton, startPauseButton,
@@ -179,7 +188,8 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private WakeWordListener wakeWordListener;
     private boolean wakeWordStartPending;
     private boolean micFaulted;
-    private boolean cameraFaulted;
+    private volatile boolean cameraFaulted;
+    private volatile boolean cameraFaultAlertLatched;
     private boolean modelErrorSpoken;
     private String customModelLoadError = "";
     private String depthModelLoadError = "";
@@ -200,8 +210,8 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private volatile boolean recordingInProgress;
 
     private long frameCount;
-    private long lastFrameAt;
-    private long cameraBindAt;
+    private volatile long lastFrameAt;
+    private volatile long cameraBindAt;
     private long lastCameraRetryAt;
     private long lastAnalysisAt;
     private long lastSpokenAt;
@@ -244,25 +254,21 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             if (!isFinishing() && foreground && cameraBindAt > 0) {
                 long reference = lastFrameAt > 0 ? lastFrameAt : cameraBindAt;
                 if (now - reference > CAMERA_TIMEOUT_MS) {
-                    if (!cameraFaulted) {
-                        cameraFaulted = true;
-                        setStatus("CAMERA TIMEOUT — RETRYING");
-                        announceFault("Camera disconnected. Trying to recover.");
+                    if (!cameraFaulted) reportCameraFault("Camera disconnected. Trying to recover.");
+                    if (!currentStatus.contains("CAMERA DISCONNECTED") && !currentStatus.contains("CAMERA ERROR")) {
+                        setStatus("CAMERA DISCONNECTED · RETRYING");
                     }
-                    if (now - lastCameraRetryAt > 6000L && cameraProvider != null) {
+                    if (now - lastCameraRetryAt > 6000L && cameraProvider != null && !cameraStartInFlight) {
                         lastCameraRetryAt = now;
                         cameraBindAt = 0L;
                         try { cameraProvider.unbindAll(); } catch (Exception ignored) { }
                         startCamera();
                     }
-                } else if (cameraFaulted && lastFrameAt > 0) {
-                    cameraFaulted = false;
-                    speakPriority("Camera restored.");
-                    setStatus("CAMERA RESTORED");
                 }
             } else if (!isFinishing() && foreground && permissionsChecked
                     && ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-                    && now - lastCameraRetryAt > 6000L) {
+                    && cameraBindAt <= 0 && !cameraStartInFlight && now - lastCameraRetryAt > 6000L) {
+                // Retry even if CameraX created a provider but failed while binding a use case.
                 lastCameraRetryAt = now;
                 startCamera();
             }
@@ -360,6 +366,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                         (fallbackDetector != null ? "GENERIC ML KIT FALLBACK" : "NO DETECTOR AVAILABLE");
                 modelsLoading = false;
                 setStatus(detectorStatus + (usingDepthModel ? " + DEPTH" : " + DEPTH UNAVAILABLE"));
+                refreshModelBadge();
                 if (!customModelLoadError.isEmpty()) {
                     android.util.Log.w("AISight", "Custom detector unavailable: " + customModelLoadError);
                 }
@@ -470,135 +477,259 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(bg);
-        root.setPadding(dp(12), dp(8), dp(12), dp(8));
+        root.setPadding(dp(14), dp(6), dp(14), dp(10));
 
+        // Brand/header
         header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView mark = new TextView(this);
+        mark.setText("A"); mark.setTextSize(21); mark.setGravity(Gravity.CENTER);
+        mark.setTextColor(bg); mark.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        mark.setBackground(roundedBackground(purple, 14, purple));
+        header.addView(mark, new LinearLayout.LayoutParams(dp(44), dp(44)));
+
+        LinearLayout brand = new LinearLayout(this);
+        brand.setOrientation(LinearLayout.VERTICAL);
+        brand.setPadding(dp(11), 0, 0, 0);
         TextView title = new TextView(this);
-        title.setText("AISIGHT  /  MOBILE"); title.setTextColor(white); title.setTextSize(18);
+        title.setText("AISIGHT"); title.setTextColor(white); title.setTextSize(20);
         title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
-        header.addView(title, new LinearLayout.LayoutParams(0, dp(48), 1));
-        settingsButton = makeButton("SETTINGS");
+        TextView subtitle = new TextView(this);
+        subtitle.setText("VISION ASSISTANT  /  MOBILE"); subtitle.setTextColor(muted); subtitle.setTextSize(9.5f);
+        subtitle.setLetterSpacing(0.08f);
+        brand.addView(title); brand.addView(subtitle);
+        header.addView(brand, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        settingsButton = makeButton("⚙");
+        settingsButton.setTextSize(21); settingsButton.setContentDescription("Open AISight settings");
         settingsButton.setOnClickListener(v -> showSettings());
-        header.addView(settingsButton, new LinearLayout.LayoutParams(dp(105), dp(42)));
-        root.addView(header, new LinearLayout.LayoutParams(-1, dp(48)));
+        header.addView(settingsButton, new LinearLayout.LayoutParams(dp(48), dp(44)));
+        LinearLayout.LayoutParams headerLp = new LinearLayout.LayoutParams(-1, dp(52));
+        headerLp.bottomMargin = dp(9);
+        root.addView(header, headerLp);
 
-        statusView = new TextView(this);
-        statusView.setTextColor(muted); statusView.setTextSize(12); statusView.setPadding(dp(3), dp(3), dp(3), dp(8));
-        statusView.setText(detectorStatus + (usingDepthModel ? " + METRIC DEPTH" : " + DEPTH MODEL MISSING"));
-        root.addView(statusView, new LinearLayout.LayoutParams(-1, -2));
+        // Status card with a live health indicator and model badge
+        statusCard = new LinearLayout(this);
+        statusCard.setOrientation(LinearLayout.HORIZONTAL);
+        statusCard.setGravity(Gravity.CENTER_VERTICAL);
+        statusCard.setPadding(dp(13), dp(10), dp(12), dp(10));
+        statusCard.setBackground(roundedBackground(panel, 15, stroke));
+        statusDotView = new TextView(this); statusDotView.setText("●"); statusDotView.setTextSize(15);
+        statusDotView.setTextColor(purple);
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(18), -2);
+        dotLp.rightMargin = dp(8); statusCard.addView(statusDotView, dotLp);
 
+        LinearLayout statusColumn = new LinearLayout(this); statusColumn.setOrientation(LinearLayout.VERTICAL);
+        TextView statusLabel = sectionText("SYSTEM STATUS");
+        statusView = new TextView(this); statusView.setTextColor(white); statusView.setTextSize(12);
+        statusView.setMaxLines(2); statusView.setText(currentStatus);
+        statusColumn.addView(statusLabel); statusColumn.addView(statusView);
+        statusCard.addView(statusColumn, new LinearLayout.LayoutParams(0, -2, 1f));
+
+        modelBadgeView = new TextView(this); modelBadgeView.setTextSize(9); modelBadgeView.setGravity(Gravity.CENTER);
+        modelBadgeView.setPadding(dp(9), dp(7), dp(9), dp(7));
+        modelBadgeView.setTextColor(mint); modelBadgeView.setBackground(roundedBackground(Color.rgb(22, 47, 48), 10, Color.rgb(40, 84, 81)));
+        statusCard.addView(modelBadgeView, new LinearLayout.LayoutParams(-2, -2));
+        LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(-1, -2);
+        statusLp.bottomMargin = dp(10); root.addView(statusCard, statusLp);
+
+        // Camera viewport and visual detections
         FrameLayout viewport = new FrameLayout(this);
-        viewport.setBackgroundColor(Color.BLACK);
+        viewport.setBackground(roundedBackground(Color.BLACK, 18, stroke));
+        viewport.setClipToOutline(true);
+        viewport.setElevation(dp(2));
         previewView = new PreviewView(this);
         previewView.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE);
         previewView.setScaleType(PreviewView.ScaleType.FILL_CENTER);
+        previewView.setBackgroundColor(Color.BLACK); previewView.setClipToOutline(true);
         viewport.addView(previewView, new FrameLayout.LayoutParams(-1, -1));
         overlayView = new DetectionOverlayView(this);
         viewport.addView(overlayView, new FrameLayout.LayoutParams(-1, -1));
+
+        cameraChipView = new TextView(this); cameraChipView.setText("●  LIVE CAMERA"); cameraChipView.setTextSize(9.5f);
+        cameraChipView.setTextColor(mint); cameraChipView.setPadding(dp(10), dp(7), dp(10), dp(7));
+        cameraChipView.setBackground(roundedBackground(Color.rgb(12, 20, 25), 10, Color.rgb(42, 72, 76)));
+        FrameLayout.LayoutParams chipLp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
+        chipLp.setMargins(dp(10), dp(10), dp(10), dp(10)); viewport.addView(cameraChipView, chipLp);
+
         headlessMessage = new TextView(this);
         headlessMessage.setBackgroundColor(Color.BLACK);
         headlessMessage.setTextColor(Color.BLACK);
         headlessMessage.setText("");
+        headlessMessage.setVisibility(View.GONE);
         viewport.addView(headlessMessage, new FrameLayout.LayoutParams(-1, -1));
-        root.addView(viewport, new LinearLayout.LayoutParams(-1, 0, 1));
+        LinearLayout.LayoutParams viewportLp = new LinearLayout.LayoutParams(-1, 0, 1f);
+        viewportLp.bottomMargin = dp(10); viewport.setMinimumHeight(dp(200));
+        root.addView(viewport, viewportLp);
 
-        detectionsView = new TextView(this);
-        detectionsView.setTextColor(white); detectionsView.setTextSize(14); detectionsView.setLineSpacing(dp(3), 1.0f);
-        detectionsView.setBackgroundColor(panel); detectionsView.setPadding(dp(12), dp(10), dp(12), dp(10));
-        detectionsView.setText("LATEST DETECTIONS\nWaiting for camera frames...");
-        LinearLayout.LayoutParams detLp = new LinearLayout.LayoutParams(-1, -2);
-        detLp.setMargins(0, dp(8), 0, dp(8)); root.addView(detectionsView, detLp);
+        detectionCard = new LinearLayout(this);
+        detectionCard.setOrientation(LinearLayout.VERTICAL);
+        detectionCard.setPadding(dp(13), dp(11), dp(13), dp(11));
+        detectionCard.setBackground(roundedBackground(panel, 15, stroke));
+        LinearLayout detectionHeading = new LinearLayout(this);
+        detectionHeading.setOrientation(LinearLayout.HORIZONTAL); detectionHeading.setGravity(Gravity.CENTER_VERTICAL);
+        TextView detectionTitle = sectionText("SCENE SNAPSHOT");
+        detectionHeading.addView(detectionTitle, new LinearLayout.LayoutParams(0, -2, 1f));
+        detectionCountView = new TextView(this); detectionCountView.setText("0 OBJECTS"); detectionCountView.setTextColor(purple);
+        detectionCountView.setTextSize(9.5f); detectionCountView.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        detectionCountView.setPadding(dp(9), dp(5), dp(9), dp(5));
+        detectionCountView.setBackground(roundedBackground(Color.rgb(40, 31, 62), 9, Color.rgb(67, 52, 99)));
+        detectionHeading.addView(detectionCountView);
+        detectionCard.addView(detectionHeading);
 
-        controls = new LinearLayout(this); controls.setOrientation(LinearLayout.VERTICAL); controls.setGravity(Gravity.CENTER);
-        topControls = new LinearLayout(this); topControls.setGravity(Gravity.CENTER);
-        bottomControls = new LinearLayout(this); bottomControls.setGravity(Gravity.CENTER);
+        detectionsView = new TextView(this); detectionsView.setTextColor(white); detectionsView.setTextSize(12.5f);
+        detectionsView.setLineSpacing(dp(3), 1.0f); detectionsView.setMaxLines(4);
+        detectionsView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        detectionsView.setText("Waiting for camera frames…");
+        LinearLayout.LayoutParams detectionBodyLp = new LinearLayout.LayoutParams(-1, -2);
+        detectionBodyLp.topMargin = dp(7); detectionCard.addView(detectionsView, detectionBodyLp);
+        LinearLayout.LayoutParams detectionLp = new LinearLayout.LayoutParams(-1, -2);
+        detectionLp.bottomMargin = dp(8); root.addView(detectionCard, detectionLp);
+
+        controls = new LinearLayout(this); controls.setOrientation(LinearLayout.VERTICAL);
+        topControls = new LinearLayout(this); topControls.setOrientation(LinearLayout.HORIZONTAL); topControls.setGravity(Gravity.CENTER);
+        bottomControls = new LinearLayout(this); bottomControls.setOrientation(LinearLayout.HORIZONTAL); bottomControls.setGravity(Gravity.CENTER);
+
         viewButton = makeButton("HEADLESS");
-        viewButton.setOnClickListener(v -> { headless = !headless; saveBoolean("headless", headless); applyDisplayMode(); });
-        readTextButton = makeButton("READ TEXT");
-        readTextButton.setOnClickListener(v -> requestReadText());
+        viewButton.setOnClickListener(v -> { headless = true; saveBoolean("headless", true); applyDisplayMode(); });
+        readTextButton = makeButton("READ TEXT"); readTextButton.setOnClickListener(v -> requestReadText());
         startPauseButton = makeButton(announcementsArmed ? "PAUSE VOICE" : "START VOICE");
         startPauseButton.setOnClickListener(v -> setAnnouncementsArmed(!announcementsArmed, true));
-        recordButton = makeButton("RECORD 10S"); recordButton.setOnClickListener(v -> {
-            if (recordingInProgress) stopRecording(true); else startRecording(10);
-        });
+        recordButton = makeButton("RECORD 10S");
+        recordButton.setOnClickListener(v -> { if (recordingInProgress) stopRecording(true); else startRecording(10); });
         voiceButton = makeButton(voiceEnabled ? "VOICE ON" : "VOICE OFF");
         voiceButton.setOnClickListener(v -> {
             voiceEnabled = !voiceEnabled; saveBoolean("voice", voiceEnabled);
-            voiceButton.setText(voiceEnabled ? "VOICE ON" : "VOICE OFF");
+            voiceButton.setText(voiceEnabled ? "VOICE ON" : "VOICE OFF"); refreshButtonStyle(voiceButton);
             if (voiceEnabled) speakPriority(tagalog ? "Boses naka-on." : "Voice announcements on.");
         });
+        batteryButton = makeButton("BATTERY"); batteryButton.setOnClickListener(v -> speakPriority(batteryStatus()));
         silenceButton = makeButton("SILENCE ALARM"); silenceButton.setOnClickListener(v -> stopAlarm());
-        Button settingsShortcut = makeButton("SETTINGS"); settingsShortcut.setOnClickListener(v -> showSettings());
-        topControls.addView(viewButton, weightedButton()); topControls.addView(readTextButton, weightedButton());
-        topControls.addView(startPauseButton, weightedButton());
-        bottomControls.addView(recordButton, weightedButton()); bottomControls.addView(voiceButton, weightedButton());
-        bottomControls.addView(settingsShortcut, weightedButton());
+
         controls.addView(topControls); controls.addView(bottomControls);
         root.addView(controls, new LinearLayout.LayoutParams(-1, -2));
         setContentView(root);
+        applyDisplayMode();
+        updateStatusIndicator(currentStatus);
+        refreshModelBadge();
     }
 
     private LinearLayout.LayoutParams weightedButton() {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(44), 1f);
-        p.setMargins(dp(2), dp(2), dp(2), dp(2)); return p;
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(46), 1f);
+        p.setMargins(dp(3), dp(3), dp(3), dp(3)); return p;
     }
 
     private Button makeButton(String text) {
-        Button button = new Button(this); button.setText(text); button.setTextSize(10.5f);
-        button.setTextColor(white); button.setAllCaps(false); button.setPadding(dp(3), 0, dp(3), 0);
-        button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.rgb(48, 34, 68)));
+        Button button = new Button(this);
+        button.setText(text); button.setTextSize(11.5f); button.setTextColor(white); button.setAllCaps(false);
+        button.setPadding(dp(5), 0, dp(5), 0); button.setGravity(Gravity.CENTER);
+        button.setMinHeight(dp(44)); button.setBackground(buttonBackground(text));
+        button.setContentDescription(text);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) button.setElevation(dp(1));
         return button;
+    }
+
+    private GradientDrawable roundedBackground(int color, int radiusDp, int borderColor) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(color); drawable.setCornerRadius(dp(radiusDp));
+        drawable.setStroke(dp(1), borderColor);
+        return drawable;
+    }
+
+    private GradientDrawable buttonBackground(String text) {
+        String t = text == null ? "" : text.toUpperCase(Locale.US);
+        int fill = Color.rgb(31, 36, 53);
+        int edge = Color.rgb(55, 62, 84);
+        if (t.contains("SILENCE")) { fill = Color.rgb(76, 29, 45); edge = Color.rgb(137, 55, 77); }
+        else if (t.contains("START") || t.contains("READ TEXT") || t.contains("SHOW CAMERA")) { fill = Color.rgb(101, 70, 177); edge = Color.rgb(159, 132, 241); }
+        else if (t.contains("PAUSE") || t.contains("VOICE ON")) { fill = Color.rgb(48, 39, 74); edge = Color.rgb(91, 73, 132); }
+        return roundedBackground(fill, 13, edge);
+    }
+
+    private void refreshButtonStyle(Button button) {
+        if (button != null) button.setBackground(buttonBackground(String.valueOf(button.getText())));
+    }
+
+    private TextView sectionText(String text) {
+        TextView label = new TextView(this); label.setText(text); label.setTextColor(muted);
+        label.setTextSize(9.5f); label.setLetterSpacing(0.09f);
+        label.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        return label;
+    }
+
+    private void refreshModelBadge() {
+        if (modelBadgeView == null) return;
+        String model = modelsLoading ? "LOADING" : (usingCustomModel ? "AISIGHT YOLO26" : "ML KIT FALLBACK");
+        modelBadgeView.setText(model + (usingDepthModel ? " · DEPTH" : " · NO DEPTH"));
+        modelBadgeView.setTextColor(usingCustomModel && usingDepthModel ? mint : (modelsLoading ? purple : warning));
+    }
+
+    private void updateStatusIndicator(String message) {
+        if (statusDotView == null) return;
+        String text = message == null ? "" : message.toUpperCase(Locale.US);
+        boolean bad = text.contains("ERROR") || text.contains("FAILED") || text.contains("DISCONNECT")
+                || text.contains("TIMEOUT") || text.contains("UNAVAILABLE") || text.contains("MISSING");
+        boolean good = text.contains("ACTIVE") || text.contains("RESTORED") || text.contains("READY")
+                || text.contains("SAVED") || text.contains("CUSTOM AISIGHT");
+        statusDotView.setTextColor(bad ? warning : (good ? mint : purple));
+        if (cameraChipView != null) {
+            if (text.contains("CAMERA DISCONNECTED") || text.contains("CAMERA ERROR") || text.contains("CAMERA TIMEOUT")) {
+                cameraChipView.setText("●  CAMERA RECOVERING");
+                cameraChipView.setTextColor(warning);
+            } else if ((text.contains("CAMERA ACTIVE") && !cameraFaulted && !cameraFaultAlertLatched)
+                    || text.contains("CAMERA RESTORED") || text.contains("LIVE FEED OK")) {
+                cameraChipView.setText("●  LIVE CAMERA");
+                cameraChipView.setTextColor(mint);
+            }
+        }
     }
 
     private void applyDisplayMode() {
         if (root == null) return;
+        refreshModelBadge();
         if (headless) {
             getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
             WindowManager.LayoutParams lp = getWindow().getAttributes(); lp.screenBrightness = 0.025f; getWindow().setAttributes(lp);
-            header.setVisibility(View.GONE); statusView.setVisibility(View.GONE); detectionsView.setVisibility(View.GONE);
-            // Keep PreviewView attached so CameraX continues analysis; the opaque black view hides its pixels.
+            header.setVisibility(View.GONE); statusCard.setVisibility(View.GONE); detectionCard.setVisibility(View.GONE);
             previewView.setVisibility(View.VISIBLE); overlayView.setVisibility(View.VISIBLE); headlessMessage.setVisibility(View.VISIBLE);
-            viewButton.setText("SHOW CAMERA");
-            controls.removeAllViews();
-            LinearLayout row = new LinearLayout(this); row.setGravity(Gravity.CENTER);
-            Button show = makeButton("SHOW CAMERA"); show.setOnClickListener(v -> {
-                headless = false; saveBoolean("headless", false); applyDisplayMode();
-            });
-            Button start = makeButton(announcementsArmed ? "PAUSE" : "START");
-            start.setOnClickListener(v -> setAnnouncementsArmed(!announcementsArmed, true));
+            controls.removeAllViews(); topControls.removeAllViews(); bottomControls.removeAllViews();
+            viewButton.setText("SHOW CAMERA"); viewButton.setContentDescription("Show camera preview");
+            viewButton.setOnClickListener(v -> { headless = false; saveBoolean("headless", false); applyDisplayMode(); });
+            refreshButtonStyle(viewButton);
+            startPauseButton.setText(announcementsArmed ? "PAUSE" : "START");
+            startPauseButton.setContentDescription(announcementsArmed ? "Pause spoken announcements" : "Start spoken announcements");
+            refreshButtonStyle(startPauseButton);
             Button settings = makeButton("SETTINGS"); settings.setOnClickListener(v -> showSettings());
-            row.addView(show, weightedButton()); row.addView(start, weightedButton()); row.addView(settings, weightedButton());
-            controls.addView(row);
-            if (alarmActive) {
-                Button silence = makeButton("SILENCE ALARM"); silence.setOnClickListener(v -> stopAlarm());
-                controls.addView(silence, new LinearLayout.LayoutParams(-1, dp(44)));
-            }
-            controls.setVisibility(View.VISIBLE);
+            topControls.addView(viewButton, weightedButton()); topControls.addView(startPauseButton, weightedButton());
+            topControls.addView(settings, weightedButton()); controls.addView(topControls);
+            if (alarmActive) controls.addView(silenceButton, new LinearLayout.LayoutParams(-1, dp(46)));
         } else {
             getWindow().getDecorView().setSystemUiVisibility(0);
             WindowManager.LayoutParams lp = getWindow().getAttributes(); lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
             getWindow().setAttributes(lp);
-            header.setVisibility(View.VISIBLE); statusView.setVisibility(View.VISIBLE); detectionsView.setVisibility(View.VISIBLE);
+            header.setVisibility(View.VISIBLE); statusCard.setVisibility(View.VISIBLE); detectionCard.setVisibility(View.VISIBLE);
             previewView.setVisibility(View.VISIBLE); overlayView.setVisibility(View.VISIBLE); headlessMessage.setVisibility(View.GONE);
-            controls.removeAllViews();
-            topControls.removeAllViews(); bottomControls.removeAllViews();
-            viewButton.setText("HEADLESS"); startPauseButton.setText(announcementsArmed ? "PAUSE VOICE" : "START VOICE");
-            recordButton.setText(recordingInProgress ? "STOP RECORDING" : "RECORD 10S");
-            voiceButton.setText(voiceEnabled ? "VOICE ON" : "VOICE OFF");
+            controls.removeAllViews(); topControls.removeAllViews(); bottomControls.removeAllViews();
+            viewButton.setText("HEADLESS"); viewButton.setContentDescription("Hide camera preview and use headless mode");
+            viewButton.setOnClickListener(v -> { headless = true; saveBoolean("headless", true); applyDisplayMode(); });
+            refreshButtonStyle(viewButton);
+            startPauseButton.setText(announcementsArmed ? "PAUSE VOICE" : "START VOICE");
+            startPauseButton.setContentDescription(announcementsArmed ? "Pause spoken announcements" : "Start spoken announcements");
+            refreshButtonStyle(startPauseButton);
+            updateRecordButton();
+            voiceButton.setText(voiceEnabled ? "VOICE ON" : "VOICE OFF"); refreshButtonStyle(voiceButton);
             topControls.addView(viewButton, weightedButton()); topControls.addView(readTextButton, weightedButton());
             topControls.addView(startPauseButton, weightedButton());
             bottomControls.addView(recordButton, weightedButton()); bottomControls.addView(voiceButton, weightedButton());
-            Button settings = makeButton("SETTINGS"); settings.setOnClickListener(v -> showSettings());
-            bottomControls.addView(settings, weightedButton());
+            bottomControls.addView(batteryButton, weightedButton());
             controls.addView(topControls); controls.addView(bottomControls);
-            if (alarmActive) {
-                Button silence = makeButton("SILENCE ALARM"); silence.setOnClickListener(v -> stopAlarm());
-                controls.addView(silence, new LinearLayout.LayoutParams(-1, dp(42)));
-            }
-            statusView.setText(detectorStatus + (usingDepthModel ? " + DEPTH" : " + NO DEPTH MODEL"));
+            if (alarmActive) controls.addView(silenceButton, new LinearLayout.LayoutParams(-1, dp(44)));
+            statusView.setText(currentStatus);
+            updateStatusIndicator(currentStatus);
         }
+        controls.setVisibility(View.VISIBLE);
     }
 
     private void requestRequiredPermissions() {
@@ -637,78 +768,137 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                     setStatus("CAMERA ACTIVE · VIDEO RECORDING UNSUPPORTED ON THIS DEVICE");
                 }
                 cameraBindAt = SystemClock.elapsedRealtime(); lastFrameAt = 0;
-                cameraFaulted = false; cameraStartInFlight = false;
+                cameraStartInFlight = false;
                 setStatus("CAMERA ACTIVE · " + detectorStatus + (usingDepthModel ? " + DEPTH" : " + DEPTH UNAVAILABLE"));
             } catch (Exception ex) {
                 cameraStartInFlight = false;
-                setStatus("CAMERA ERROR · " + message(ex)); announceFault("Camera could not start. Check camera permission and try again.");
+                cameraBindAt = 0L;
+                setStatus("CAMERA ERROR · " + message(ex)); reportCameraFault("Camera could not start. Check camera permission and try again.");
             }
         }, ContextCompat.getMainExecutor(this));
     }
 
     private void analyzeFrame(@NonNull ImageProxy proxy) {
+        // Heartbeat is updated as soon as CameraX hands over a frame, before any AI work.
+        // Neural inference is offloaded so slow depth/object models cannot look like a disconnected camera.
         long now = SystemClock.elapsedRealtime();
-        long minInterval = headless ? 850L : 280L;
-        if (now - lastAnalysisAt < minInterval) { proxy.close(); return; }
-        lastAnalysisAt = now; lastFrameAt = now;
+        lastFrameAt = now;
+        if (cameraFaulted || cameraFaultAlertLatched) {
+            mainHandler.post(() -> {
+                if (cameraFaulted || cameraFaultAlertLatched) {
+                    cameraFaulted = false;
+                    cameraFaultAlertLatched = false;
+                    speakPriority("Camera restored.");
+                    setStatus("CAMERA RESTORED · LIVE FEED OK");
+                }
+            });
+        }
         if (modelsLoading || activityDestroyed) { proxy.close(); return; }
-        if (cameraFaulted) {
-            cameraFaulted = false; mainHandler.post(() -> speakPriority("Camera restored."));
-        }
-        Bitmap frame;
-        try { frame = YoloTfliteDetector.imageProxyToUprightBitmap(proxy); }
-        catch (Exception ex) {
-            proxy.close(); setStatus("CAMERA FRAME ERROR · " + message(ex)); return;
-        }
-        frameCount++;
-        if (readTextRequested.compareAndSet(true, false)) {
-            InputImage input = InputImage.fromBitmap(frame, 0);
-            textRecognizer.process(input)
-                    .addOnSuccessListener(this::onTextRead)
-                    .addOnFailureListener(e -> { setStatus("TEXT READING FAILED"); speakPriority(tagalog ? "Hindi mabasa ang teksto." : "Could not read text."); })
-                    .addOnCompleteListener(task -> { frame.recycle(); proxy.close(); });
+
+        long minInterval = headless ? 850L : 280L;
+        if (now - lastAnalysisAt < minInterval || !inferenceInProgress.compareAndSet(false, true)) {
+            // Keep accepting the camera heartbeat while deliberately dropping queued frames.
+            proxy.close();
             return;
         }
+        lastAnalysisAt = now;
 
-        if (usingDepthModel && depthEstimator != null && (latestDepthMap == null || frameCount % 2 == 0)) {
-            try { latestDepthMap = depthEstimator.estimate(frame); }
-            catch (Exception ex) {
-                depthModelLoadError = message(ex);
-                if (frameCount % 20 == 0) setStatus("DEPTH ERROR · " + depthModelLoadError);
+        Bitmap frame = null;
+        boolean queued = false;
+        try {
+            frame = YoloTfliteDetector.imageProxyToUprightBitmap(proxy);
+            final Bitmap capturedFrame = frame;
+            modelExecutor.execute(() -> analyzeBitmap(capturedFrame));
+            queued = true;
+            frame = null; // the inference worker now owns this bitmap
+        } catch (Exception ex) {
+            setStatus("CAMERA FRAME ERROR · " + message(ex));
+        } finally {
+            try { proxy.close(); } catch (Exception ignored) { }
+            if (!queued) {
+                if (frame != null && !frame.isRecycled()) frame.recycle();
+                inferenceInProgress.set(false);
             }
         }
-        final DepthTfliteEstimator.DepthMap depthForFrame = latestDepthMap;
+    }
 
-        if (usingCustomModel && yoloDetector != null) {
-            try {
-                List<YoloTfliteDetector.Detection> objects = yoloDetector.detectBitmap(frame, confidenceThreshold);
-                processDetections(objects, frame.getWidth(), frame.getHeight(), depthForFrame);
-            } catch (Exception ex) {
-                setStatus("CUSTOM MODEL ERROR · " + message(ex));
-                if (!modelErrorSpoken) { modelErrorSpoken = true; speakPriority("Object detector error. Check AISight model settings."); }
-            } finally { frame.recycle(); proxy.close(); }
+    private void analyzeBitmap(Bitmap frame) {
+        if (activityDestroyed || frame == null || frame.isRecycled()) {
+            releaseInferenceFrame(frame);
             return;
         }
-        if (fallbackDetector == null) { frame.recycle(); proxy.close(); return; }
-        InputImage input = InputImage.fromBitmap(frame, 0);
-        fallbackDetector.process(input)
-                .addOnSuccessListener(objects -> {
-                    List<YoloTfliteDetector.Detection> generic = new ArrayList<>();
-                    for (DetectedObject object : objects) {
-                        String label = "object"; float score = 0.0f;
-                        if (!object.getLabels().isEmpty()) {
-                            label = object.getLabels().get(0).getText().toLowerCase(Locale.US);
-                            score = object.getLabels().get(0).getConfidence();
-                            if (score < confidenceThreshold) continue;
-                        }
-                        Rect r = object.getBoundingBox();
-                        generic.add(new YoloTfliteDetector.Detection(label, score, -1,
-                                new RectF(r.left, r.top, r.right, r.bottom)));
+        frameCount++;
+        try {
+            if (readTextRequested.compareAndSet(true, false)) {
+                InputImage input = InputImage.fromBitmap(frame, 0);
+                textRecognizer.process(input)
+                        .addOnSuccessListener(this::onTextRead)
+                        .addOnFailureListener(e -> {
+                            setStatus("TEXT READING FAILED");
+                            speakPriority(tagalog ? "Hindi mabasa ang teksto." : "Could not read text.");
+                        })
+                        .addOnCompleteListener(task -> releaseInferenceFrame(frame));
+                return;
+            }
+
+            if (usingDepthModel && depthEstimator != null && (latestDepthMap == null || frameCount % 2 == 0)) {
+                try { latestDepthMap = depthEstimator.estimate(frame); }
+                catch (Exception ex) {
+                    depthModelLoadError = message(ex);
+                    if (frameCount % 20 == 0) setStatus("DEPTH ERROR · " + depthModelLoadError);
+                }
+            }
+            final DepthTfliteEstimator.DepthMap depthForFrame = latestDepthMap;
+
+            if (usingCustomModel && yoloDetector != null) {
+                try {
+                    List<YoloTfliteDetector.Detection> objects = yoloDetector.detectBitmap(frame, confidenceThreshold);
+                    processDetections(objects, frame.getWidth(), frame.getHeight(), depthForFrame);
+                } catch (Exception ex) {
+                    setStatus("CUSTOM MODEL ERROR · " + message(ex));
+                    if (!modelErrorSpoken) {
+                        modelErrorSpoken = true;
+                        speakPriority("Object detector error. Check AISight model settings.");
                     }
-                    processDetections(generic, frame.getWidth(), frame.getHeight(), depthForFrame);
-                })
-                .addOnFailureListener(ex -> setStatus("DETECTION ERROR · " + message(ex)))
-                .addOnCompleteListener(task -> { frame.recycle(); proxy.close(); });
+                } finally { releaseInferenceFrame(frame); }
+                return;
+            }
+
+            if (fallbackDetector == null) {
+                setStatus("NO OBJECT DETECTOR AVAILABLE");
+                releaseInferenceFrame(frame);
+                return;
+            }
+            InputImage input = InputImage.fromBitmap(frame, 0);
+            fallbackDetector.process(input)
+                    .addOnSuccessListener(objects -> {
+                        List<YoloTfliteDetector.Detection> generic = new ArrayList<>();
+                        for (DetectedObject object : objects) {
+                            String label = "object"; float score = 0.0f;
+                            if (!object.getLabels().isEmpty()) {
+                                label = object.getLabels().get(0).getText().toLowerCase(Locale.US);
+                                score = object.getLabels().get(0).getConfidence();
+                                if (score < confidenceThreshold) continue;
+                            }
+                            Rect r = object.getBoundingBox();
+                            generic.add(new YoloTfliteDetector.Detection(label, score, -1,
+                                    new RectF(r.left, r.top, r.right, r.bottom)));
+                        }
+                        processDetections(generic, frame.getWidth(), frame.getHeight(), depthForFrame);
+                    })
+                    .addOnFailureListener(ex -> setStatus("DETECTION ERROR · " + message(ex)))
+                    .addOnCompleteListener(task -> releaseInferenceFrame(frame));
+        } catch (Exception ex) {
+            setStatus("ANALYSIS ERROR · " + message(ex));
+            releaseInferenceFrame(frame);
+        }
+    }
+
+    private void releaseInferenceFrame(Bitmap frame) {
+        try {
+            if (frame != null && !frame.isRecycled()) frame.recycle();
+        } catch (Exception ignored) { }
+        finally { inferenceInProgress.set(false); }
     }
 
     private void processDetections(List<YoloTfliteDetector.Detection> detected, int width, int height,
@@ -763,15 +953,26 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         }
         overlayView.update(overlayItems, width, height);
 
-        StringBuilder visual = new StringBuilder(usingCustomModel ? "AISIGHT CUSTOM MODEL · LATEST DETECTIONS" : "GENERIC DETECTOR FALLBACK");
+        StringBuilder visual = new StringBuilder();
         StringBuilder spoken = new StringBuilder();
-        if (speakList.isEmpty()) visual.append("\nNo objects above the confidence threshold.");
+        if (detections.isEmpty()) {
+            visual.append("No objects above the confidence threshold.");
+        } else {
+            int displayLimit = Math.min(5, detections.size());
+            for (int i = 0; i < displayLimit; i++) {
+                DetectionInfo d = detections.get(i);
+                String label = translateLabel(d.label, tagalog);
+                String distance = isFinite(d.meters) ? String.format(Locale.US, "%.1f m", d.meters) : "distance unavailable";
+                if (visual.length() > 0) visual.append("\n");
+                visual.append(i + 1).append(". ").append(label).append(" · ")
+                        .append(d.pos3).append(" · ").append(Math.round(d.confidence * 100)).append("% · ").append(distance);
+            }
+            if (detections.size() > displayLimit) visual.append("\n+ ").append(detections.size() - displayLimit).append(" more object(s)");
+        }
+
         for (int i = 0; i < speakList.size(); i++) {
             DetectionInfo d = speakList.get(i);
             String label = translateLabel(d.label, tagalog);
-            String distance = isFinite(d.meters) ? String.format(Locale.US, "%.1f m", d.meters) : "distance unavailable";
-            visual.append("\n").append(i + 1).append(". ").append(label).append(" · ")
-                    .append(d.pos3).append(" · ").append(Math.round(d.confidence * 100)).append("% · ").append(distance);
             if (i > 0) spoken.append(". ");
             if ("default".equals(phraseMode)) {
                 spoken.append(label).append(", ").append(translatePosition(distanceBucket(d.meters), tagalog)).append(", ").append(translatePosition(d.pos3, tagalog));
@@ -783,21 +984,31 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         }
         if ("navigation".equals(phraseMode) && advice != null) {
             String localizedAdvice = translateAdvice(advice, tagalog);
-            visual.append("\nNAV: ").append(localizedAdvice);
+            if (visual.length() > 0) visual.append("\n");
+            visual.append("NAV · ").append(localizedAdvice);
             if (spoken.length() > 0) spoken.append(". ");
             spoken.append(localizedAdvice);
         }
-        if (depthMap == null) visual.append("\nDEPTH MODEL UNAVAILABLE — distances and wall checks disabled.");
+        if (depthMap == null) {
+            if (visual.length() > 0) visual.append("\n");
+            visual.append("Distance estimates unavailable — depth model not active.");
+        }
         latestVisual(visual.toString(), detections.size());
         maybeSpeak(spoken.toString(), "navigation".equals(phraseMode));
     }
 
     private void latestVisual(String visual, int count) {
         runOnUiThread(() -> {
-            if (!headless) {
+            if (!headless && detectionsView != null) {
                 detectionsView.setText(visual);
-                statusView.setText((usingCustomModel ? "AISIGHT YOLO26N" : "GENERIC FALLBACK") + " · " + count
-                        + " OBJECTS · " + (usingDepthModel && latestDepthMap != null ? "DEPTH ON" : "DEPTH OFF"));
+                boolean textResult = visual.startsWith("TEXT FOUND") || visual.startsWith("TEXT READING");
+                if (detectionCountView != null) detectionCountView.setText(textResult ? "OCR RESULT" : count + (count == 1 ? " OBJECT" : " OBJECTS"));
+                currentStatus = textResult ? (visual.startsWith("TEXT FOUND") ? "TEXT RECOGNITION COMPLETE" : "TEXT READING COMPLETE")
+                        : (usingCustomModel ? "CUSTOM AISIGHT MODEL" : "GENERIC FALLBACK") + " · " + count
+                        + " OBJECTS · " + (usingDepthModel && latestDepthMap != null ? "DEPTH ACTIVE" : "DEPTH UNAVAILABLE");
+                if (statusView != null) statusView.setText(currentStatus);
+                updateStatusIndicator(currentStatus);
+                refreshModelBadge();
             }
         });
     }
@@ -850,7 +1061,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
     private void setAnnouncementsArmed(boolean value, boolean announce) {
         announcementsArmed = value; saveBoolean("armed", value);
-        if (startPauseButton != null) startPauseButton.setText(value ? "PAUSE VOICE" : "START VOICE");
+        if (startPauseButton != null) { startPauseButton.setText(value ? (headless ? "PAUSE" : "PAUSE VOICE") : (headless ? "START" : "START VOICE")); refreshButtonStyle(startPauseButton); }
         if (announce) speakPriority(value ? (tagalog ? "Ipagpapatuloy ang mga anunsyo." : "AISight announcements resumed.")
                 : (tagalog ? "Tahimik muna." : "AISight going quiet. Say AISight start to resume."));
         if (headless) applyDisplayMode();
@@ -883,18 +1094,30 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         speakPriority(text);
     }
 
+    /** Announce only once per continuous camera outage. Recovery is confirmed by a real frame. */
+    private void reportCameraFault(String text) {
+        cameraFaulted = true;
+        if (cameraFaultAlertLatched) return;
+        cameraFaultAlertLatched = true;
+        announceFault(text);
+    }
+
     private void startAlarm(long durationMs) {
+        boolean wasActive = alarmActive;
+        long now = SystemClock.elapsedRealtime();
         alarmActive = true;
-        alarmDeadline = Math.max(alarmDeadline, SystemClock.elapsedRealtime() + Math.min(durationMs, MAX_ALARM_MS));
-        if (vibrator != null) {
-            try {
-                long[] pattern = {0, 350, 180, 350, 450};
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0));
-                else vibrator.vibrate(pattern, 0);
-            } catch (Exception ignored) { }
+        alarmDeadline = Math.max(alarmDeadline, now + Math.min(durationMs, MAX_ALARM_MS));
+        if (!wasActive) {
+            if (vibrator != null) {
+                try {
+                    long[] pattern = {0, 350, 180, 350, 450};
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0));
+                    else vibrator.vibrate(pattern, 0);
+                } catch (Exception ignored) { }
+            }
+            mainHandler.removeCallbacks(alarmToneRunnable);
+            mainHandler.post(alarmToneRunnable);
         }
-        mainHandler.removeCallbacks(alarmToneRunnable);
-        mainHandler.post(alarmToneRunnable);
         mainHandler.removeCallbacks(alarmStopRunnable);
         mainHandler.postDelayed(alarmStopRunnable, Math.max(1000, alarmDeadline - SystemClock.elapsedRealtime()));
         if (root != null) applyDisplayMode();
@@ -1141,7 +1364,10 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     }
 
     private void updateRecordButton() {
-        if (recordButton != null) recordButton.setText(recordingInProgress ? "STOP RECORDING" : "RECORD 10S");
+        if (recordButton != null) {
+            recordButton.setText(recordingInProgress ? "STOP RECORDING" : "RECORD 10S");
+            refreshButtonStyle(recordButton);
+        }
     }
 
     private int parseRecordingSeconds(String command) {
@@ -1198,9 +1424,11 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private void showSettings() {
         ScrollView scroll = new ScrollView(this);
         LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(20), dp(12), dp(20), dp(12)); box.setBackgroundColor(panel);
-        TextView title = new TextView(this); title.setText("AISIGHT SETTINGS"); title.setTextColor(white); title.setTextSize(19);
-        title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD); title.setPadding(0, 0, 0, dp(10)); box.addView(title);
+        box.setPadding(dp(20), dp(16), dp(20), dp(16)); box.setBackground(roundedBackground(panel, 20, stroke));
+        TextView title = new TextView(this); title.setText("SETTINGS"); title.setTextColor(white); title.setTextSize(22);
+        title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD); title.setPadding(0, 0, 0, dp(3)); box.addView(title);
+        TextView subtitle = new TextView(this); subtitle.setText("Tune the way AISight sees and speaks.");
+        subtitle.setTextColor(muted); subtitle.setTextSize(12); subtitle.setPadding(0, 0, 0, dp(12)); box.addView(subtitle);
 
         Switch headlessSwitch = makeSwitch("Headless mode — black screen, dim display, lower analysis rate", headless);
         headlessSwitch.setOnCheckedChangeListener((button, checked) -> { headless = checked; saveBoolean("headless", checked); applyDisplayMode(); }); box.addView(headlessSwitch);
@@ -1244,6 +1472,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this).setView(scroll)
                 .setPositiveButton("DONE", (d, w) -> applyDisplayMode()).create();
         dialog.show(); dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setTextColor(purple);
+        if (dialog.getWindow() != null) dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
     }
 
     private interface StringSetter { void set(String value); }
@@ -1253,7 +1482,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             String current = row.getText().toString();
             int index = 0; for (int i = 0; i < choices.length; i++) if (current.endsWith(choices[i].toUpperCase(Locale.US))) index = i;
             String next = choices[(index + 1) % choices.length]; setter.set(next);
-            row.setText(label + ": " + next.toUpperCase(Locale.US));
+            row.setText(label + ": " + next.toUpperCase(Locale.US)); refreshButtonStyle(row);
         });
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(44)); p.setMargins(0, dp(3), 0, dp(3)); box.addView(row, p);
     }
@@ -1348,7 +1577,7 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static boolean isFinite(float value) {
         return !Float.isNaN(value) && !Float.isInfinite(value);
     }
-    
+
     private static String distanceBucket(float meters) {
         if (!isFinite(meters)) return "distance unavailable";
         if (meters <= 1.0f) return "very close";
@@ -1370,7 +1599,12 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static boolean anyWord(String text, String... words) { for (String w : words) if (containsWord(text, w)) return true; return false; }
     private static String message(Throwable e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
     private void setStatus(String text) {
-        runOnUiThread(() -> { if (statusView != null && !headless) statusView.setText(text); });
+        currentStatus = text == null ? "" : text;
+        runOnUiThread(() -> {
+            if (statusView != null && !headless) statusView.setText(currentStatus);
+            updateStatusIndicator(currentStatus);
+            refreshModelBadge();
+        });
     }
     private int dp(float n) { return Math.round(n * getResources().getDisplayMetrics().density); }
 
